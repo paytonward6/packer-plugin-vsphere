@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"reflect"
 	"time"
 
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
@@ -98,10 +99,16 @@ func NewDriver(config *ConnectConfig) (Driver, error) {
 		return nil, err
 	}
 
-	vimClient.RoundTripper = session.KeepAlive(vimClient.RoundTripper, 10*time.Minute)
 	client := &govmomi.Client{
 		Client:         vimClient,
 		SessionManager: session.NewManager(vimClient),
+	}
+
+	vimClient.RoundTripper = &vSphereReauthRoundTripper{
+		inner: session.KeepAlive(vimClient.RoundTripper, 1*time.Minute),
+		reAuthFunc: func() error {
+			return client.Login(ctx, credentials)
+		},
 	}
 
 	err = client.SessionManager.Login(ctx, credentials)
@@ -127,6 +134,7 @@ func NewDriver(config *ConnectConfig) (Driver, error) {
 		datacenter: datacenter,
 		finder:     finder,
 	}
+
 	return d, nil
 }
 
@@ -146,4 +154,51 @@ func (r *RestClient) Login(ctx context.Context) error {
 
 func (r *RestClient) Logout(ctx context.Context) error {
 	return r.client.Logout(ctx)
+}
+
+type authFunc func() error
+
+type vSphereReauthRoundTripper struct {
+	reAuthFunc authFunc
+	inner      soap.RoundTripper
+}
+
+// retries once on not authenticated
+func (r *vSphereReauthRoundTripper) RoundTrip(ctx context.Context, req, res soap.HasFault) error {
+	err := r.inner.RoundTrip(ctx, req, res)
+	if err == nil {
+		return nil
+	}
+
+	if isNotAuthenticated(err) {
+		err = r.reAuthFunc()
+		if err != nil {
+			return err
+		}
+
+		// Must set response to zero value of underyling type prior to retry since
+		// the previous response will still contain the NotAuthenticated fault
+		zeroInterface(res)
+
+		err = r.inner.RoundTrip(ctx, req, res)
+		return err
+	}
+	return err
+}
+
+// Takes a pointer, inspects the type, and sets the pointer to that type's zero value
+func zeroInterface(f any) {
+	z := reflect.Zero(reflect.TypeOf(f).Elem())
+	v := reflect.ValueOf(f).Elem()
+	v.Set(z)
+}
+
+func isNotAuthenticated(err error) bool {
+	if soap.IsSoapFault(err) {
+		switch soap.ToSoapFault(err).VimFault().(type) {
+		case types.NotAuthenticated:
+			return true
+		}
+	}
+	return false
 }
